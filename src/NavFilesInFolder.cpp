@@ -2377,10 +2377,10 @@ static void UpdateFolderListMetricsAndColors(FolderFilesPanel* panel, int dpi) {
     Color txtCol = ThemeWindowTextColor();
 
     if (panel->headerLabel) {
-        panel->headerLabel->SetColor(kColTextFg, txtCol);
+        panel->headerLabel->SetColor(kColText, txtCol);
     }
     if (panel->dirLabel) {
-        panel->dirLabel->SetColor(kColTextFg, AccentColor(txtCol, 65));
+        panel->dirLabel->SetColor(kColText, AccentColor(txtCol, 65));
     }
     if (panel->filterEdit) {
         panel->filterEdit->SetColors(txtCol, listBg);
