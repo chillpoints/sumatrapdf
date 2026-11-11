@@ -359,6 +359,12 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
     // width of the AI chat sidebar
     int aiChatDx = 0;
 
+    // Docked right-side Folder Files playlist sidebar (see NavFilesInFolder.cpp)
+    HWND hwndFolderFilesBox = nullptr;
+    VirtSplitter* folderFilesSplitter = nullptr;
+    struct FolderFilesPanel* folderFilesPanel = nullptr;
+    int folderFilesDx = 0;
+
     // vertical splitter for resizing left side panel
     // the splitters are virtual controls living in the frame's own tree
     // (frameRoot), not child windows
@@ -529,6 +535,7 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
     // selected
     HwndSlot* favoritesTabSlot = nullptr;
     HwndSlot* canvasSlot = nullptr;
+    HwndSlot* folderFilesSlot = nullptr;
     HwndSlot* aiChatSlot = nullptr;
     HwndSlot* tabsSlot = nullptr;
     HwndSlot* menuSlot = nullptr;
@@ -611,6 +618,8 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
             // 0: no page info bar, else 1 + PageInfoBarMode
             int pageInfoBar = 0;
             bool showMenuBarRebar = false;
+            bool folderFilesVisible = false;
+            int folderFilesDx = 0;
             bool aiChatVisible = false;
             int aiChatDx = 0;
             bool sidebarOnRight = false;
@@ -623,6 +632,7 @@ struct MainWindow { // NOLINT(clang-analyzer-optin.performance.Padding)
         bool sidebarTopVisible = false;
         bool sidebarMiddleVisible = false;
         bool sidebarBottomVisible = false;
+        bool folderFilesVisible = false;
         bool aiChatVisible = false;
         bool updatePending = false; // a FrameUpdateUi uitask is queued
         bool toolbarDirty = false;  // repaint the toolbar on the next update

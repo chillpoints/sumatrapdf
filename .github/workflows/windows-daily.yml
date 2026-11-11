@@ -1,10 +1,5 @@
 name: windows-daily
 on:
-  schedule:
-    # the daily pre-release artifacts
-    - cron: "0 1 * * *"
-    # the test run, offset so the two don't queue for a runner together
-    - cron: "20 4 * * *"
   repository_dispatch:
     types: [build-daily]
   workflow_dispatch:

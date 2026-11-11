@@ -383,6 +383,7 @@ const commandsRaw = [
     "CmdViewAsHex", "View As Hex",
     "CmdAIChatWithCustomAPI", "Custom AI chat...",
     "CmdSaveTrimmedPagesAs", "Save Trimmed Pages As...",
+    "CmdToggleFolderSidebar", "Toggle Folder Files Sidebar",
 ];
 
 // removed slots are dropped: nothing outside the generators should see them

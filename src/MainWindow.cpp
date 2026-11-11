@@ -42,6 +42,7 @@
 #include "AIChatTypes.h"
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
+#include "NavFilesInFolder.h"
 #include "SelectionToolbar.h"
 #include "AnnotEditToolbar.h"
 #include "AnnotTextPopup.h"
@@ -239,6 +240,7 @@ MainWindow::~MainWindow() {
     }
     delete favViewLayout;
 
+    DestroyFolderFilesPanel(this);
     DestroyAIChatPanel(this);
 
     // owns chrome, the content row, the splitters and the slots

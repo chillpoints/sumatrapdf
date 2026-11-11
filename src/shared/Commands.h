@@ -376,8 +376,9 @@ enum {
     CmdViewAsHex = 570,
     CmdAIChatWithCustomAPI = 571,
     CmdSaveTrimmedPagesAs = 572,
+    CmdToggleFolderSidebar = 573,
 
-    CmdLast = 572,
+    CmdLast = 573,
     CmdFirstCustom = CmdLast + 100,
 
     // aliases, at the end to not mess ordering

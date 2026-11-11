@@ -41,6 +41,7 @@
 #include "HomePage.h"
 #include "Translations.h"
 #include "Toolbar.h"
+#include "NavFilesInFolder.h"
 #include "PagePosition.h"
 #include "resource.h"
 #include "DarkMode.h"
@@ -227,6 +228,10 @@ static MenuDef menuDefContext[] = {
     {
         TrN("Show &Thumbnails"),
         CmdToggleThumbnails,
+    },
+    {
+        TrN("Show Folder Files"),
+        CmdToggleFolderSidebar,
     },
     {
         TrN("Sh&ow Toolbar"),
@@ -904,6 +909,7 @@ static void MenuUpdateStateForWindow(MainWindow* win) {
     MenuSetChecked(win->menu, CmdToggleBookmarks, checked);
     MenuSetEnabled(win->menu, CmdToggleThumbnails, CanShowThumbnails(tab));
     MenuSetChecked(win->menu, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
+    MenuSetChecked(win->menu, CmdToggleFolderSidebar, IsFolderFilesSidebarEnabled());
 
     MenuSetChecked(win->menu, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));
     MenuSetChecked(win->menu, CmdFavoriteShowInTab, FindFavoritesTab(win) != nullptr);
@@ -1217,6 +1223,7 @@ void OnWindowContextMenu(MainWindow* win, int x, int y) {
     MenuSetChecked(popup, CmdToggleBookmarks, IsSidebarViewShown(win, SidebarView::Bookmarks));
     MenuSetEnabled(popup, CmdToggleThumbnails, CanShowThumbnails(tab));
     MenuSetChecked(popup, CmdToggleThumbnails, IsSidebarViewShown(win, SidebarView::Thumbnails));
+    MenuSetChecked(popup, CmdToggleFolderSidebar, IsFolderFilesSidebarEnabled());
 
     MenuSetEnabled(popup, CmdFavoriteToggle, HasFavorites());
     MenuSetChecked(popup, CmdFavoriteToggle, IsSidebarViewShown(win, SidebarView::Favorites));

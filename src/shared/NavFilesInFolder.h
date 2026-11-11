@@ -21,3 +21,13 @@ void ResetQuickAccessCache();
 
 void ShowNavFilesInFolder(MainWindow* win, Str selectPath = {}, bool skipHistory = false);
 TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut);
+
+void CreateFolderFilesPanel(MainWindow* win);
+void DestroyFolderFilesPanel(MainWindow* win);
+void SyncFolderFilesToCurrentTab(MainWindow* win, bool forceRefresh = false);
+void OnFolderFilesToggle(MainWindow* win, int forceState = -1);
+bool IsFolderFilesSidebarEnabled();
+void UpdateFolderFilesTheme(MainWindow* win);
+void UpdateFolderFilesDpi(MainWindow* win, int dpi);
+void RelayoutFolderFilesPanel(MainWindow* win);
+void InvalidateFolderFilesPanel(MainWindow* win);

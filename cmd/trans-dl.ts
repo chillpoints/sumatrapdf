@@ -1405,9 +1405,33 @@ async function main() {
 
   const secret = tryGetTransSecret();
   if (!secret) {
-    console.log("TRANS_UPLOAD_SECRET not set; skipping download/AI");
-    writeEmptyTranslations();
-    return;
+    console.log("TRANS_UPLOAD_SECRET not set; building .work/translations.txt from public history");
+    try {
+      const strs = extractStringsToTranslate();
+      strs.sort();
+      const hist = await downloadHistory(args.server);
+      const perLang = new Map<string, Map<string, string>>();
+      for (const [lang, m] of hist) {
+        if (lang.length > 5) continue;
+        const langMap = new Map<string, string>();
+        for (const s of strs) {
+          const raw = m.get(s);
+          if (raw) {
+            const clean = raw.replace(/\r/g, "").replace(/\n/g, "\\n").trimEnd();
+            if (clean.length > 0) langMap.set(s, clean);
+          }
+        }
+        perLang.set(lang, langMap);
+      }
+      const pt: ParsedTranslations = { perLang, allStrings: strs, fromServer: clonePerLang(perLang) };
+      autoAddStrippedMatches(pt, buildStrippedIndex(hist, pt));
+      writeTranslationsForBinary(pt, "public-history");
+      return;
+    } catch (e) {
+      console.log(`public history download failed (${e}); falling back to empty translations`);
+      writeEmptyTranslations();
+      return;
+    }
   }
 
   const strs = extractStringsToTranslate();

@@ -341,6 +341,10 @@ MenuDef menuDefView[] = {
         CmdToggleThumbnails,
     },
     {
+        TrN("Show Folder Files"),
+        CmdToggleFolderSidebar,
+    },
+    {
         TrN("Show Me&nu"),
         CmdToggleMenuBar,
     },

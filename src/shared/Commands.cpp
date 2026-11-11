@@ -382,6 +382,7 @@ const CommandInfo gCommands[] = {
     {CmdViewAsHex, "CmdViewAsHex\0", StrL("View As Hex")},
     {CmdAIChatWithCustomAPI, "CmdAIChatWithCustomAPI\0", StrL("Custom AI chat...")},
     {CmdSaveTrimmedPagesAs, "CmdSaveTrimmedPagesAs\0", StrL("Save Trimmed Pages As...")},
+    {CmdToggleFolderSidebar, "CmdToggleFolderSidebar\0", StrL("Toggle Folder Files Sidebar")},
 };
 const int gCommandsCount = dimofi(gCommands);
 
@@ -450,6 +451,7 @@ static const ArgSpec argSpecs[] = {
     {CmdTogglePresentationMode, kCmdArgState, CommandArg::Type::Bool}, // default
     {CmdToggleBookmarks, kCmdArgState, CommandArg::Type::Bool},        // default
     {CmdToggleTableOfContents, kCmdArgState, CommandArg::Type::Bool},  // default
+    {CmdToggleFolderSidebar, kCmdArgState, CommandArg::Type::Bool},    // default
 #ifndef NO_THUMBNAIL_STATE_ARG
     {CmdToggleThumbnails, kCmdArgState, CommandArg::Type::Bool}, // default
 #endif

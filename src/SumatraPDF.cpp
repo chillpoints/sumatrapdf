@@ -1549,6 +1549,7 @@ void ControllerCallbackHandler::PageNoChanged(DocController* ctrl, int pageNo) {
 
     UpdateTocSelection(win, pageNo);
     win->currPageNo = pageNo;
+    InvalidateFolderFilesPanel(win);
 
     if (!wnd) {
         return;
@@ -1826,6 +1827,7 @@ static void UpdateUiForCurrentTab(MainWindow* win) {
             win->chapterEdit->SetText({});
         }
     }
+    SyncFolderFilesToCurrentTab(win);
 }
 
 static float EbookLayoutAspectForView(MainWindow* win, Str path, DisplayMode displayMode, float zoom);
@@ -2557,7 +2559,7 @@ void FrameSyncSplitters(MainWindow* win) {
         CollectVirtCtrls(win->captionLayout, tops);
     }
     VirtSplitter* all[] = {win->sidebarSplitter, win->sidebarPanelsSplitter, win->sidebarMiddleSplitter,
-                           win->aiChatSplitter};
+                           win->folderFilesSplitter, win->aiChatSplitter};
     for (VirtSplitter* s : all) {
         if (s) {
             VecAppend(tops, s);
@@ -2659,6 +2661,7 @@ static void CreateFrameLayout(MainWindow* win) {
     win->sidebarBottomSlot = new HwndSlot();
     win->favoritesTabSlot = new HwndSlot();
     win->canvasSlot = new HwndSlot();
+    win->folderFilesSlot = new HwndSlot();
     win->aiChatSlot = new HwndSlot();
     win->tabsSlot = new HwndSlot();
     win->tabsSlot->mapRtlX = true;
@@ -2669,6 +2672,9 @@ static void CreateFrameLayout(MainWindow* win) {
     win->toolbarBottomSlot = new HwndSlot();
     win->pageInfoBarSlot = new HwndSlot();
     CreateCaptionLayout(win);
+
+    win->folderFilesSplitter = NewFrameSplitter(SplitterType::Vert, true);
+    win->folderFilesSplitter->thickness = kSplitterDx;
 
     // the webview is expensive to resize, so this one only moves the panes
     // when the drag ends
@@ -2693,6 +2699,8 @@ static void CreateFrameLayout(MainWindow* win) {
     row->AddChild(sidebar);
     row->AddChild(win->sidebarSplitter);
     row->AddChild(content, 1);
+    row->AddChild(win->folderFilesSplitter);
+    row->AddChild(win->folderFilesSlot);
     row->AddChild(win->aiChatSplitter);
     row->AddChild(win->aiChatSlot);
     win->frameLayout = row;
@@ -2736,6 +2744,8 @@ static void CreateSidebar(MainWindow* win) {
     CreateFavorites(win);
     AttachSidebarViews(win);
 
+    CreateFolderFilesPanel(win);
+    SyncFolderFilesToCurrentTab(win);
     CreateAIChatPanel(win);
 
     if (win->uiState.sidebarTopVisible) {
@@ -3127,6 +3137,7 @@ void UpdateAfterThemeChange() {
         RefreshSelectionToolbarIcons(win);
         RefreshAnnotEditToolbar(win);
         RefreshAnnotationHoverOverlay(win);
+        UpdateFolderFilesTheme(win);
         UpdateAIChatTheme(win);
         DarkModeApplyToFrameAfterThemeChange(win);
         UpdateWindowFrameBorderColor(win);
@@ -4904,6 +4915,7 @@ static void CloseDocumentInCurrentTab(MainWindow* win, bool keepUIEnabled, bool 
 
     if (!keepUIEnabled) {
         SetTocVisibility(win, false);
+        SyncFolderFilesToCurrentTab(win);
         ToolbarUpdateStateForWindow(win, true);
         UpdateToolbarPageText(win, 0);
         UpdateToolbarFindText(win);
@@ -6889,7 +6901,8 @@ static bool IsUiLayoutEq(UILayout* s1, UILayout* s2) {
            s1->sidebarBottomVisible == s2->sidebarBottomVisible &&
            s1->sidebarMiddleVisible == s2->sidebarMiddleVisible && s1->favoritesAsTab == s2->favoritesAsTab &&
            s1->sigBarVisible == s2->sigBarVisible && s1->pageInfoBar == s2->pageInfoBar &&
-           s1->showMenuBarRebar == s2->showMenuBarRebar && s1->aiChatVisible == s2->aiChatVisible &&
+           s1->showMenuBarRebar == s2->showMenuBarRebar && s1->folderFilesVisible == s2->folderFilesVisible &&
+           s1->folderFilesDx == s2->folderFilesDx && s1->aiChatVisible == s2->aiChatVisible &&
            s1->aiChatDx == s2->aiChatDx && s1->sidebarOnRight == s2->sidebarOnRight &&
            s1->sidebarAutoHide == s2->sidebarAutoHide;
 }
@@ -7069,6 +7082,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         curState.pageInfoBar = 1 + (int)GetPageInfoBarMode();
     }
     curState.showMenuBarRebar = IsShowingMenuBarRebar(win);
+    curState.folderFilesVisible = !favAsTabNow && !win->IsFullScreenOrPresentation() && !win->isQuickLook &&
+                                  win->uiState.folderFilesVisible && (win->hwndFolderFilesBox != nullptr);
+    curState.folderFilesDx = win->folderFilesDx;
     curState.aiChatVisible = win->uiState.aiChatVisible;
     curState.aiChatDx = win->aiChatDx;
     curState.sidebarOnRight = SidebarOnRightLayout();
@@ -7113,6 +7129,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         bool topVis = !favAsTab && ui.sidebarTopVisible;
         bool middleVis = !favAsTab && ui.sidebarMiddleVisible;
         bool bottomVis = !favAsTab && ui.sidebarBottomVisible;
+        bool folderVis = !favAsTab && !win->IsFullScreenOrPresentation() && !win->isQuickLook &&
+                         ui.folderFilesVisible && win->hwndFolderFilesBox;
         bool aiVis = !favAsTab && ui.aiChatVisible;
         // a floating sidebar has no splitters and shows only when revealed
         bool floats = SidebarFloats(win);
@@ -7127,6 +7145,10 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         // canvas stays sized under a Favorites tab (only hidden) so switching
         // back does not SetViewPortSize with a 0x0 canvas
         HwndSetVisible(win->hwndCanvas, !favAsTab);
+        if (win->hwndFolderFilesBox) {
+            HwndSetVisible(win->hwndFolderFilesBox, folderVis);
+            win->folderFilesSplitter->SetIsVisible(folderVis);
+        }
         if (win->hwndAiChatBox) {
             HwndSetVisible(win->hwndAiChatBox, aiVis);
             win->aiChatSplitter->SetIsVisible(aiVis);
@@ -7201,6 +7223,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     bool layMiddle = middleVisible && !sidebarFloats;
     bool layBottom = bottomVisible && !sidebarFloats;
     bool laySidebar = sidebarVisible && !sidebarFloats;
+    bool folderFilesVisible = !favAsTab && !win->IsFullScreenOrPresentation() && !win->isQuickLook &&
+                              win->uiState.folderFilesVisible && win->hwndFolderFilesBox;
     bool aiChatVisible = !favAsTab && win->uiState.aiChatVisible && win->hwndAiChatBox;
     bool showCaption = !win->IsFullScreenOrPresentation() && win->tabsInTitlebar && gSettings->showCaption;
     bool showingMenuBar = IsShowingMenuBarRebar(win);
@@ -7315,14 +7339,28 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         middleDy = limitValue(middleDy, kTocMinDy, std::max(kTocMinDy, restDy - kTocMinDy));
     }
 
+    int folderFilesDxApplied = 0;
+    if (folderFilesVisible) {
+        folderFilesDxApplied = win->folderFilesDx;
+        if (folderFilesDxApplied <= 0) {
+            folderFilesDxApplied = DpiScale(260);
+        }
+        int usedLeft = laySidebar ? (sidebarDxApplied + kSplitterDx) : 0;
+        int availForRight = std::max(rc.dx - usedLeft - kMinDocCanvasDx, kSidebarMinDx);
+        int maxFolderDx = std::max(kSidebarMinDx, std::min(availForRight, rc.dx / 2));
+        folderFilesDxApplied = limitValue(folderFilesDxApplied, kSidebarMinDx, maxFolderDx);
+        win->folderFilesDx = folderFilesDxApplied;
+    }
+
     int aiChatDx = 0;
     if (aiChatVisible) {
         aiChatDx = win->aiChatDx;
         if (aiChatDx <= 0) {
             aiChatDx = rc.dx * 3 / 8;
         }
-        int availDx = rc.dx - (laySidebar ? sidebarDxApplied + kSplitterDx : 0);
-        aiChatDx = limitValue(aiChatDx, kSidebarMinDx, availDx / 2);
+        int availDx = rc.dx - (laySidebar ? sidebarDxApplied + kSplitterDx : 0) -
+                      (folderFilesVisible ? folderFilesDxApplied + kSplitterDx : 0);
+        aiChatDx = limitValue(aiChatDx, kSidebarMinDx, std::max(kSidebarMinDx, availDx / 2));
         win->aiChatDx = aiChatDx;
     }
 
@@ -7333,6 +7371,8 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     SetVis(win->favoritesTabSlot, favAsTab);
     SetVis(win->sidebarPanelsSplitter, layTop && layBottom);
     SetVis(win->sidebarSplitter, laySidebar);
+    SetVis(win->folderFilesSplitter, folderFilesVisible);
+    SetVis(win->folderFilesSlot, folderFilesVisible);
     SetVis(win->aiChatSplitter, aiChatVisible);
     SetVis(win->aiChatSlot, aiChatVisible);
 
@@ -7341,6 +7381,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     win->sidebarMiddleSlot->dx = sidebarDxApplied;
     win->sidebarMiddleSlot->dy = middleDy;
     win->sidebarBottomSlot->dx = sidebarDxApplied;
+    win->folderFilesSlot->dx = folderFilesDxApplied;
     win->aiChatSlot->dx = aiChatDx;
     if (win->frameLayout) {
         win->frameLayout->rtl = SidebarOnRightLayout();
@@ -7368,6 +7409,7 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
     BindSlot(win->sidebarBottomSlot, bottomHwnd, &dh, layBottom && !isFrameResize && !isSplitterDrag);
     BindSlot(win->favoritesTabSlot, win->favoritesTabPanel->hwnd, &dh, favAsTab);
     BindSlot(win->canvasSlot, win->hwndCanvas, &dh, !discardCanvasBits);
+    BindSlot(win->folderFilesSlot, win->hwndFolderFilesBox, &dh, folderFilesVisible);
     BindSlot(win->aiChatSlot, win->hwndAiChatBox, &dh, aiChatVisible);
 
     win->chromeLayout->Layout(Tight({rc.dx, rc.dy}));
@@ -7399,10 +7441,12 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         }
     }
 
-    HwndSlot* chromeSlots[] = {
-        win->tabsSlot,         win->menuSlot,    win->toolbarTopSlot, win->toolbarBottomSlot, win->capMenuSlot,
-        win->capTabsRow1,      win->capTabsRow2, win->sidebarTopSlot, win->sidebarMiddleSlot, win->sidebarBottomSlot,
-        win->favoritesTabSlot, win->canvasSlot,  win->aiChatSlot,     win->sigBarSlot,        win->pageInfoBarSlot};
+    HwndSlot* chromeSlots[] = {win->tabsSlot,          win->menuSlot,         win->toolbarTopSlot,
+                               win->toolbarBottomSlot, win->capMenuSlot,      win->capTabsRow1,
+                               win->capTabsRow2,       win->sidebarTopSlot,   win->sidebarMiddleSlot,
+                               win->sidebarBottomSlot, win->favoritesTabSlot, win->canvasSlot,
+                               win->folderFilesSlot,   win->aiChatSlot,       win->sigBarSlot,
+                               win->pageInfoBarSlot};
     for (HwndSlot* s : chromeSlots) {
         ClearSlotDefer(s);
     }
@@ -7479,6 +7523,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         // (issue #5866). Matches EndFrameRedrawSuppression, which has always done this.
         RedrawWindow(win->hwndFrame, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
     }
+    if (folderFilesVisible) {
+        RelayoutFolderFilesPanel(win);
+    }
     if (win->uiState.aiChatVisible && win->hwndAiChatBox) {
         RelayoutAIChatPanel(win);
     }
@@ -7493,6 +7540,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx) {
         }
         if (layMiddle) {
             win->sidebarMiddleSplitter->Invalidate();
+        }
+        if (folderFilesVisible) {
+            win->folderFilesSplitter->Invalidate();
         }
     }
     if (updateToolbars && win->isToolbarVisible) {
@@ -7795,6 +7845,7 @@ static void ApplyMainWindowDpiChromeRefresh(MainWindow* win, HWND hwnd) {
     }
     ApplySidebarDpiFonts(win, dpi);
     HomePageOnDpiChanged(win, dpi);
+    UpdateFolderFilesDpi(win, dpi);
     UpdateAIChatDpi(win, dpi);
 
     // window margin / page spacing are dpi-scaled, so they change too
@@ -10837,8 +10888,19 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
             ShowNavFilesInFolder(win);
             break;
 
+        case CmdToggleFolderSidebar: {
+            int forceState = -1;
+            CommandArg* arg = GetCommandArg(cmd, kCmdArgState);
+            if (arg) {
+                forceState = arg->boolVal ? 1 : 0;
+            }
+            OnFolderFilesToggle(win, forceState);
+            break;
+        }
+
         case CmdRenameFile:
             RenameCurrentFile(win);
+            SyncFolderFilesToCurrentTab(win, true);
             break;
 
         case CmdCopyTemporaryFileToNonTemporary:
@@ -10853,14 +10915,17 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
 
         case CmdDeleteFile:
             DeleteCurrentFile(win);
+            SyncFolderFilesToCurrentTab(win, true);
             break;
 
         case CmdDeleteFileAndOpenNext:
             DeleteCurrentFileAndOpenNext(win);
+            SyncFolderFilesToCurrentTab(win, true);
             break;
 
         case CmdSaveAs:
             SaveCurrentFileAs(win);
+            SyncFolderFilesToCurrentTab(win, true);
             break;
 
         case CmdPrint:

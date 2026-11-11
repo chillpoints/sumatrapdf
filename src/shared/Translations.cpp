@@ -142,6 +142,48 @@ static void ParseTranslationsTxt(Str d, Str langCode) {
 
 // don't free the result
 Str GetTranslation(Str s) {
+    bool isCn = str::Eq(gCurrLangCode, StrL("cn"));
+    bool isTw = str::Eq(gCurrLangCode, StrL("tw"));
+    if (str::Eq(s, StrL("Show Folder Files"))) {
+        if (isCn) {
+            return StrL("\xe6\x98\xbe\xe7\xa4\xba\xe7\x9b\xae\xe5\xbd\x95\xe6\x96\x87\xe4\xbb\xb6");
+        }
+        if (isTw) {
+            return StrL("\xe9\xa1\xaf\xe7\xa4\xba\xe7\x9b\xae\xe9\x8c\x84\xe6\xaa\x94\xe6\xa1\x88");
+        }
+        return s;
+    }
+    if (str::Eq(s, StrL("Toggle Folder Files Sidebar"))) {
+        if (isCn) {
+            return StrL(
+                "\xe5\x88\x87\xe6\x8d\xa2\xe7\x9b\xae\xe5\xbd\x95\xe6\x96\x87\xe4\xbb\xb6\xe4\xbe\xa7\xe8\xbe\xb9\xe6"
+                "\xa0\x8f");
+        }
+        if (isTw) {
+            return StrL(
+                "\xe5\x88\x87\xe6\x8f\x9b\xe7\x9b\xae\xe9\x8c\x84\xe6\xaa\x94\xe6\xa1\x88\xe5\x81\xb4\xe9\x82\x8a\xe6"
+                "\xac\x84");
+        }
+        return s;
+    }
+    if (str::Eq(s, StrL("Files in Folder"))) {
+        if (isCn) {
+            return StrL("\xe7\x9b\xae\xe5\xbd\x95\xe6\x96\x87\xe4\xbb\xb6");
+        }
+        if (isTw) {
+            return StrL("\xe7\x9b\xae\xe9\x8c\x84\xe6\xaa\x94\xe6\xa1\x88");
+        }
+        return s;
+    }
+    if (str::Eq(s, StrL("Refresh Folder"))) {
+        if (isCn) {
+            return StrL("\xe5\x88\xb7\xe6\x96\xb0\xe7\x9b\xae\xe5\xbd\x95");
+        }
+        if (isTw) {
+            return StrL("\xe9\x87\x8d\xe6\x96\xb0\xe6\x95\xb4\xe7\x90\x86\xe7\x9b\xae\xe9\x8c\x84");
+        }
+        return s;
+    }
     if (gCurrLangIdx == 0) {
         // 0 is english, no translation needed
         return s;

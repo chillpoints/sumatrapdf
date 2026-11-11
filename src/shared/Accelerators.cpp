@@ -148,6 +148,7 @@ static Accel gBuiltInAccelerators[] = {
     {{kShift | kCtrl | kVirt, 'H'}, CmdToggleAutomaticallyScroll},
     {{kVirt, VK_F12}, CmdToggleBookmarks},
     {{kShift | kVirt, VK_F12}, CmdNavigateTableOfContents},
+    {{kCtrl | kVirt, VK_F12}, CmdToggleFolderSidebar},
     {{kShift | kCtrl | kVirt, VK_SUBTRACT}, CmdRotateLeft},
     {{kShift | kCtrl | kVirt, VK_OEM_MINUS}, CmdRotateLeft},
     {{kShift | kCtrl | kVirt, 'T'}, CmdReopenLastClosedFile},

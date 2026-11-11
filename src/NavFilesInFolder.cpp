@@ -38,6 +38,8 @@
 #include "NavFilesInFolder.h"
 #include "NavFilesInFolderCommon.h"
 #include "AppHelpersCommon.h"
+#include "Menu.h"
+#include "PagePosition.h"
 
 // A modeless directory browser listing sub-directories and files SumatraPDF
 // can open (judged by extension). Enter / double-click replaces the document
@@ -1412,4 +1414,1271 @@ TempStr NavFilesInFolderStateTemp(Str action, int idx, int* exitCodeOut) {
     int canFwd = wnd->navBtns[NavBtnForward]->IsEnabled();
     return fmt("OK scan=%d sel=%d items=%d back=%d fwd=%d dir=\"%s\" name=\"%s\" scrollY=%d", (int)wnd->scanInFlight,
                sel, m->ItemsCount(), canBack, canFwd, wnd->currDir, name, wnd->listBox->scrollY);
+}
+
+// ============================================================================
+// Docked Right-Side Folder Files Playlist Sidebar (FolderFilesPanel)
+// ============================================================================
+
+constexpr int kFolderSidebarDefaultWidthDip = 260;
+constexpr int kFolderSidebarMinWidthDip = 180;
+constexpr int kFolderSidebarMaxWidthDip = 600;
+
+static bool gFolderSidebarSettingsLoaded = false;
+static bool gFolderSidebarEnabled = true;
+static int gFolderSidebarWidthDip = kFolderSidebarDefaultWidthDip;
+static u64 gNextFolderPanelToken = 0;
+
+static int ParsePositiveIntSlice(Str s, int defVal) {
+    str::TrimWSInPlace(s, str::TrimOpt::Both);
+    if (len(s) <= 0) {
+        return defVal;
+    }
+    int val = 0;
+    bool anyDigit = false;
+    for (int i = 0; i < len(s); i++) {
+        char c = s.s[i];
+        if (c < '0' || c > '9') {
+            break;
+        }
+        anyDigit = true;
+        val = (val * 10) + (c - '0');
+        if (val > 10000) {
+            break;
+        }
+    }
+    return anyDigit ? val : defVal;
+}
+
+static TempStr GetFolderSidebarConfigPathTemp() {
+    if (!CanAccessDisk() || gPluginMode) {
+        return {};
+    }
+    TempStr dir = GetSumatraDataDirTemp();
+    if (len(dir) == 0) {
+        return {};
+    }
+    return path::JoinTemp(dir, StrL("SumatraPDF-folder-sidebar.ini"));
+}
+
+static void EnsureFolderSidebarSettingsLoaded() {
+    if (gFolderSidebarSettingsLoaded) {
+        return;
+    }
+    gFolderSidebarSettingsLoaded = true;
+    TempStr cfgPath = GetFolderSidebarConfigPathTemp();
+    if (len(cfgPath) == 0 || !file::Exists(cfgPath)) {
+        return;
+    }
+    Str data = file::ReadFile(cfgPath);
+    if (len(data) == 0) {
+        str::Free(data);
+        return;
+    }
+    Str rest = data;
+    Str line;
+    while (str::NextLine(rest, line, rest)) {
+        str::TrimWSInPlace(line, str::TrimOpt::Both);
+        if (str::TrimPrefix(line, StrL("enabled="))) {
+            int v = ParsePositiveIntSlice(line, 1);
+            gFolderSidebarEnabled = (v != 0);
+        } else if (str::TrimPrefix(line, StrL("width="))) {
+            int w = ParsePositiveIntSlice(line, kFolderSidebarDefaultWidthDip);
+            gFolderSidebarWidthDip = limitValue(w, kFolderSidebarMinWidthDip, kFolderSidebarMaxWidthDip);
+        }
+    }
+    str::Free(data);
+}
+
+static void SaveFolderSidebarSettings() {
+    if (gDontSaveSettings) {
+        return;
+    }
+    TempStr cfgPath = GetFolderSidebarConfigPathTemp();
+    if (len(cfgPath) == 0) {
+        return;
+    }
+    TempStr content = fmt("enabled=%d\nwidth=%d\n", gFolderSidebarEnabled ? 1 : 0, gFolderSidebarWidthDip);
+    file::WriteFile(cfgPath, content);
+}
+
+bool IsFolderFilesSidebarEnabled() {
+    EnsureFolderSidebarSettingsLoaded();
+    return gFolderSidebarEnabled;
+}
+
+enum FolderPanelBtn {
+    FolderBtnBack = 0,
+    FolderBtnForward = 1,
+    FolderBtnUp = 2,
+    FolderBtnRefresh = 3,
+    FolderBtnCount = 4
+};
+
+struct ListBoxModelFolder : ListBoxModelNav {
+    Vec<int> fileOrd;
+    int totalFiles = 0;
+};
+
+static void RebuildFolderModelEntries(ListBoxModelFolder* m, const StrVec& words) {
+    FilterNavEntries(m, words);
+    VecReset(m->fileOrd);
+    int ord = 0;
+    for (int i = 0; i < len(m->entries); i++) {
+        if (m->entries[i].isDir) {
+            VecAppend(m->fileOrd, 0);
+        } else {
+            ord++;
+            VecAppend(m->fileOrd, ord);
+        }
+    }
+    m->totalFiles = ord;
+}
+
+struct FolderFilesPanel {
+    MainWindow* ownerWin = nullptr;
+    u64 token = 0;
+    UINT_PTR boxSubclassId = 0;
+    UINT_PTR filterSubclassId = 0;
+
+    VirtRoot* root = nullptr;
+    ILayout* layout = nullptr;
+    HBox* headerBox = nullptr;
+    VirtText* headerLabel = nullptr;
+    VirtCloseButton* closeBtn = nullptr;
+    VirtIconButton* navBtns[FolderBtnCount]{};
+    VirtText* dirLabel = nullptr;
+    Edit* filterEdit = nullptr;
+    VirtListBox* listBox = nullptr;
+
+    StrVec filterWords;
+    Vec<u8> highlighted;
+    Str currDir;
+    Str activeFilePath;
+    Str pendingSelectPath;
+    StrVec history;
+    int histIdx = -1;
+    int scanGen = 0;
+    bool scanInFlight = false;
+    int pressedItemIdx = -1;
+
+    ~FolderFilesPanel() {
+        scanGen++;
+        str::Free(currDir);
+        str::Free(activeFilePath);
+        str::Free(pendingSelectPath);
+    }
+};
+
+static TempStr FolderEntryPathTemp(FolderFilesPanel* panel, const NavFileEntry& e) {
+    if (str::Eq(e.name, StrL(".."))) {
+        return path::GetDirTemp(panel->currDir);
+    }
+    if (e.path) {
+        return e.path;
+    }
+    Str name = e.name;
+    if (e.isDir && len(name) > 0) {
+        name = Str(name.s, len(name) - 1);
+    }
+    return path::JoinTemp(panel->currDir, name);
+}
+
+static int FindFolderEntryIndex(FolderFilesPanel* panel, ListBoxModelFolder* m, Str selectPath) {
+    if (!m || len(selectPath) == 0) {
+        return -1;
+    }
+    for (int i = 0; i < len(m->entries); i++) {
+        TempStr p = FolderEntryPathTemp(panel, m->entries[i]);
+        if (str::EqI(p, selectPath) || path::IsSame(p, selectPath)) {
+            return i;
+        }
+    }
+    TempStr base = path::GetBaseNameTemp(selectPath);
+    for (int i = 0; i < len(m->entries); i++) {
+        if (str::EqI(NavEntryBaseName(m->entries[i]), base)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void FolderPanelPushHistory(FolderFilesPanel* panel, Str dir) {
+    if (len(dir) == 0) {
+        return;
+    }
+    if (panel->histIdx >= 0 && panel->histIdx < len(panel->history) &&
+        path::IsSame(panel->history[panel->histIdx], dir)) {
+        return;
+    }
+    while (len(panel->history) > panel->histIdx + 1) {
+        panel->history.RemoveAt(len(panel->history) - 1);
+    }
+    if (len(panel->history) >= kNavHistoryMax) {
+        panel->history.RemoveAt(0);
+    }
+    panel->history.Append(dir);
+    panel->histIdx = len(panel->history) - 1;
+}
+
+static void UpdateFolderPanelHeaderAndButtons(FolderFilesPanel* panel) {
+    if (!panel) {
+        return;
+    }
+    if (panel->headerLabel) {
+        auto* m = panel->listBox ? (ListBoxModelFolder*)panel->listBox->model : nullptr;
+        int fileCount = m ? m->totalFiles : 0;
+        if (fileCount > 0) {
+            panel->headerLabel->SetText(fmt("%s (%d)", Tr("Files in Folder"), fileCount));
+        } else {
+            panel->headerLabel->SetText(Tr("Files in Folder"));
+        }
+        panel->headerLabel->Invalidate();
+    }
+    if (panel->dirLabel) {
+        if (len(panel->currDir) == 0) {
+            panel->dirLabel->SetText(Str{});
+            panel->dirLabel->SetTooltip(Str{});
+        } else {
+            TempStr leaf = path::GetBaseNameTemp(panel->currDir);
+            Str shown = len(leaf) > 0 ? (Str)leaf : panel->currDir;
+            panel->dirLabel->SetText(shown);
+            panel->dirLabel->SetTooltip(panel->currDir);
+        }
+        panel->dirLabel->Invalidate();
+    }
+    bool canBack = panel->histIdx > 0;
+    bool canFwd = (panel->histIdx >= 0) && (panel->histIdx + 1 < len(panel->history));
+    bool canUp = len(panel->currDir) > 0 && NavDirHasParent(panel->currDir);
+    bool canRefresh = len(panel->currDir) > 0;
+    bool states[FolderBtnCount] = {canBack, canFwd, canUp, canRefresh};
+    for (int i = 0; i < FolderBtnCount; i++) {
+        if (panel->navBtns[i]) {
+            panel->navBtns[i]->SetIsEnabled(states[i]);
+        }
+    }
+}
+
+struct FolderScanReq {
+    HWND hwndFrame = nullptr;
+    u64 token = 0;
+    int gen = 0;
+    bool isRefresh = false;
+    Str dir;
+    ~FolderScanReq() { str::Free(dir); }
+};
+
+struct FolderScanResult {
+    HWND hwndFrame = nullptr;
+    u64 token = 0;
+    int gen = 0;
+    bool isRefresh = false;
+    Str dir;
+    Vec<NavFileEntry> entries;
+    ~FolderScanResult() {
+        str::Free(dir);
+        for (NavFileEntry& e : entries) {
+            FreeNavEntry(e);
+        }
+    }
+};
+
+static void FinishFolderDirScan(FolderScanResult* r) {
+    AutoDelete del(r);
+    MainWindow* mw = FindMainWindowByHwnd(r->hwndFrame);
+    if (!mw || !IsMainWindowValidAndNotClosing(mw)) {
+        return;
+    }
+    FolderFilesPanel* panel = mw->folderFilesPanel;
+    if (!panel || panel->token != r->token || panel->scanGen != r->gen || !panel->listBox) {
+        return;
+    }
+    panel->scanInFlight = false;
+    auto* m = (ListBoxModelFolder*)panel->listBox->model;
+    if (!m) {
+        m = new ListBoxModelFolder();
+    }
+    if (r->isRefresh && SameNavEntries(m->all, r->entries)) {
+        UpdateFolderPanelHeaderAndButtons(panel);
+        panel->listBox->Invalidate();
+        return;
+    }
+    int prevScrollY = panel->listBox->scrollY;
+    StealNavEntries(m->all, r->entries);
+    RebuildFolderModelEntries(m, panel->filterWords);
+    panel->listBox->SetModel(m);
+    UpdateFolderPanelHeaderAndButtons(panel);
+
+    int selIdx = -1;
+    if (len(panel->pendingSelectPath) > 0) {
+        selIdx = FindFolderEntryIndex(panel, m, panel->pendingSelectPath);
+    }
+    if (selIdx < 0 && len(panel->activeFilePath) > 0) {
+        selIdx = FindFolderEntryIndex(panel, m, panel->activeFilePath);
+    }
+    if (m->ItemsCount() > 0) {
+        if (r->isRefresh) {
+            if (selIdx >= 0) {
+                panel->listBox->SetCurrentSelection(std::min(selIdx, m->ItemsCount() - 1));
+            }
+            panel->listBox->ScrollTo(prevScrollY);
+        } else if (selIdx >= 0) {
+            SelectAndEnsureVisible(panel->listBox, selIdx);
+        } else {
+            panel->listBox->SetCurrentSelection(0);
+        }
+    }
+    panel->listBox->Invalidate();
+}
+
+static void FolderDirScanThread(FolderScanReq* req) {
+    AutoDelete delReq(req);
+    auto* r = new FolderScanResult();
+    r->hwndFrame = req->hwndFrame;
+    r->token = req->token;
+    r->gen = req->gen;
+    r->isRefresh = req->isRefresh;
+    r->dir = str::Dup(req->dir);
+    if (len(req->dir) > 0) {
+        CollectNavEntriesForDir(req->dir, r->entries);
+        // Remove synthetic ".." row when at drive root (Up button already disabled)
+        if (!NavDirHasParent(req->dir) && len(r->entries) > 0 && str::Eq(r->entries[0].name, StrL(".."))) {
+            FreeNavEntry(r->entries[0]);
+            VecRemoveAt(r->entries, 0);
+        }
+    }
+    auto fn = MkFunc0(FinishFolderDirScan, r);
+    uitask::Post(fn, "FinishFolderDirScan");
+}
+
+static void FolderPanelSetDir(FolderFilesPanel* panel, Str dir, Str selectPath, NavListReset reset) {
+    if (!panel || !panel->listBox || !panel->ownerWin) {
+        return;
+    }
+    if (!path::IsSame(dir, panel->currDir) && panel->filterEdit && len(panel->filterWords) > 0) {
+        panel->filterWords.Reset();
+        panel->filterEdit->SetText(Str{});
+    }
+    str::ReplaceWithCopy(&panel->currDir, dir);
+    str::ReplaceWithCopy(&panel->pendingSelectPath, selectPath);
+    panel->scanGen++;
+    panel->scanInFlight = true;
+
+    auto* m = (ListBoxModelFolder*)panel->listBox->model;
+    if (!m) {
+        m = new ListBoxModelFolder();
+    }
+    if (reset == NavListReset::Clear) {
+        ClearNavModel(m);
+        if (len(dir) > 0 && NavDirHasParent(dir)) {
+            AppendNavParentEntry(m->all);
+        }
+        RebuildFolderModelEntries(m, panel->filterWords);
+        panel->listBox->SetModel(m);
+        panel->listBox->Invalidate();
+    }
+    UpdateFolderPanelHeaderAndButtons(panel);
+
+    auto* req = new FolderScanReq();
+    req->hwndFrame = panel->ownerWin->hwndFrame;
+    req->token = panel->token;
+    req->gen = panel->scanGen;
+    req->isRefresh = (reset == NavListReset::Keep);
+    req->dir = str::Dup(panel->currDir);
+    RunAsync(MkFunc0(FolderDirScanThread, req), StrL("FolderDirScan"));
+}
+
+static void FolderPanelNavigate(FolderFilesPanel* panel, Str dir, Str selectPath = {},
+                                NavListReset reset = NavListReset::Clear) {
+    if (len(dir) == 0 || !dir::Exists(dir)) {
+        return;
+    }
+    FolderPanelPushHistory(panel, dir);
+    FolderPanelSetDir(panel, dir, selectPath, reset);
+}
+
+static void FolderPanelGoUp(FolderFilesPanel* panel) {
+    if (!panel || len(panel->currDir) == 0 || !NavDirHasParent(panel->currDir)) {
+        return;
+    }
+    TempStr cameFrom = str::DupTemp(panel->currDir);
+    TempStr parentDir = path::GetDirTemp(panel->currDir);
+    if (len(parentDir) > 0 && dir::Exists(parentDir)) {
+        FolderPanelNavigate(panel, parentDir, cameFrom);
+    }
+}
+
+static void FolderPanelGoBack(FolderFilesPanel* panel) {
+    if (!panel || panel->histIdx <= 0) {
+        return;
+    }
+    TempStr cameFrom = str::DupTemp(panel->currDir);
+    panel->histIdx--;
+    Str targetDir = panel->history[panel->histIdx];
+    FolderPanelSetDir(panel, targetDir, SelectIfChildOf(cameFrom, targetDir), NavListReset::Clear);
+}
+
+static void FolderPanelGoForward(FolderFilesPanel* panel) {
+    if (!panel || panel->histIdx + 1 >= len(panel->history)) {
+        return;
+    }
+    TempStr cameFrom = str::DupTemp(panel->currDir);
+    panel->histIdx++;
+    Str targetDir = panel->history[panel->histIdx];
+    FolderPanelSetDir(panel, targetDir, SelectIfChildOf(cameFrom, targetDir), NavListReset::Clear);
+}
+
+static void FolderPanelRefresh(FolderFilesPanel* panel) {
+    if (!panel || len(panel->currDir) == 0) {
+        return;
+    }
+    TempStr dir = str::DupTemp(panel->currDir);
+    TempStr sel = str::DupTemp(panel->activeFilePath);
+    FolderPanelSetDir(panel, dir, sel, NavListReset::Keep);
+}
+
+static void FolderPanelActivateIndex(FolderFilesPanel* panel, int idx, bool inNewTab) {
+    if (!panel || !panel->listBox || !panel->ownerWin) {
+        return;
+    }
+    auto* m = (ListBoxModelFolder*)panel->listBox->model;
+    if (!m || idx < 0 || idx >= m->ItemsCount()) {
+        return;
+    }
+    NavFileEntry& e = m->entries[idx];
+    if (str::Eq(e.name, StrL(".."))) {
+        FolderPanelGoUp(panel);
+        return;
+    }
+    TempStr targetPath = str::DupTemp(FolderEntryPathTemp(panel, e));
+    if (e.isDir) {
+        FolderPanelNavigate(panel, targetPath);
+        return;
+    }
+
+    MainWindow* mw = panel->ownerWin;
+    if (!IsMainWindowValidAndNotClosing(mw)) {
+        return;
+    }
+
+    if (inNewTab) {
+        WindowTab* existing = FindTabInWindow(targetPath, mw);
+        if (!existing) {
+            existing = FindTabByFilePath(targetPath);
+        }
+        if (existing) {
+            SelectTabInWindow(existing);
+            if (existing->win) {
+                HwndSetFocus(existing->win->hwndFrame);
+            }
+            return;
+        }
+        DismissNextFileScrollHint(mw);
+        LoadArgs args(targetPath, mw);
+        StartLoadDocument(&args);
+        HwndSetFocus(mw->hwndFrame);
+        return;
+    }
+
+    WindowTab* curTab = mw->CurrentTab();
+    if (curTab && !curTab->IsAboutTab() && len(curTab->filePath) > 0 && path::IsSame(curTab->filePath, targetPath)) {
+        HwndSetFocus(mw->hwndFrame);
+        return;
+    }
+    if (curTab && !MaybeSaveAnnotations(curTab)) {
+        return;
+    }
+    DismissNextFileScrollHint(mw);
+    str::ReplaceWithCopy(&panel->activeFilePath, targetPath);
+    panel->listBox->SetCurrentSelection(idx);
+    panel->listBox->Invalidate();
+
+    LoadArgs args(targetPath, mw);
+    args.forceReuse = true;
+    StartLoadDocument(&args);
+    HwndSetFocus(mw->hwndFrame);
+}
+
+static void OnFolderFilterChanged(FolderFilesPanel* panel) {
+    if (!panel || !panel->filterEdit || !panel->listBox) {
+        return;
+    }
+    TempStr s = panel->filterEdit->GetTextTemp();
+    panel->filterWords.Reset();
+    SplitFilterToWords(s, panel->filterWords);
+
+    auto* m = (ListBoxModelFolder*)panel->listBox->model;
+    if (!m) {
+        return;
+    }
+    RebuildFolderModelEntries(m, panel->filterWords);
+    panel->listBox->SetModel(m);
+    UpdateFolderPanelHeaderAndButtons(panel);
+
+    if (m->ItemsCount() == 0) {
+        panel->listBox->SetCurrentSelection(-1);
+    } else if (len(panel->filterWords) > 0) {
+        SelectAndEnsureVisible(panel->listBox, 0);
+    } else {
+        int idx = FindFolderEntryIndex(panel, m, panel->activeFilePath);
+        SelectAndEnsureVisible(panel->listBox, idx >= 0 ? idx : 0);
+    }
+    panel->listBox->Invalidate();
+}
+
+static void OnFolderListMouseDown(FolderFilesPanel* panel, VirtMouseEvent* ev) {
+    if (!panel || !panel->listBox) {
+        return;
+    }
+    VirtListBox* lb = panel->listBox;
+    if (ev->button == 0) {
+        panel->pressedItemIdx = lb->ItemFromPoint(ev->pt);
+        lb->OnMouseDown(ev);
+        return;
+    }
+    if (ev->button == 2) {
+        int idx = lb->ItemFromPoint(ev->pt);
+        panel->pressedItemIdx = idx;
+        if (idx >= 0) {
+            lb->SetCurrentSelection(idx);
+        }
+        ev->didHandle = true;
+        return;
+    }
+    panel->pressedItemIdx = -1;
+}
+
+static void OnFolderListMouseUp(FolderFilesPanel* panel, VirtMouseEvent* ev) {
+    if (!panel || !panel->listBox) {
+        return;
+    }
+    VirtListBox* lb = panel->listBox;
+    int downIdx = panel->pressedItemIdx;
+    panel->pressedItemIdx = -1;
+
+    if (ev->button == 0) {
+        lb->OnMouseUp(ev);
+        int upIdx = lb->ItemFromPoint(ev->pt);
+        if (downIdx >= 0 && upIdx == downIdx) {
+            FolderPanelActivateIndex(panel, upIdx, ev->isCtrl);
+        }
+        return;
+    }
+    if (ev->button == 2) {
+        int upIdx = lb->ItemFromPoint(ev->pt);
+        if (downIdx >= 0 && upIdx == downIdx) {
+            FolderPanelActivateIndex(panel, upIdx, true);
+        }
+        ev->didHandle = true;
+    }
+}
+
+static void OnFolderListDoubleClick(FolderFilesPanel* panel, VirtMouseEvent* ev) {
+    if (panel) {
+        panel->pressedItemIdx = -1;
+    }
+    ev->didHandle = true;
+}
+
+static void OnFolderListKeyDown(FolderFilesPanel* panel, VirtKeyEvent* ev) {
+    if (!panel || !panel->listBox) {
+        return;
+    }
+    if (ev->vkey == VK_RETURN) {
+        int sel = panel->listBox->GetCurrentSelection();
+        if (sel >= 0) {
+            FolderPanelActivateIndex(panel, sel, ev->isCtrl);
+        }
+        ev->didHandle = true;
+        return;
+    }
+    if ((ev->vkey == VK_UP && ev->isAlt) || ev->vkey == VK_BACK) {
+        FolderPanelGoUp(panel);
+        ev->didHandle = true;
+        return;
+    }
+    if (ev->vkey == VK_LEFT && ev->isAlt) {
+        FolderPanelGoBack(panel);
+        ev->didHandle = true;
+        return;
+    }
+    if (ev->vkey == VK_RIGHT && ev->isAlt) {
+        FolderPanelGoForward(panel);
+        ev->didHandle = true;
+        return;
+    }
+    if (ev->vkey == VK_F5) {
+        FolderPanelRefresh(panel);
+        ev->didHandle = true;
+        return;
+    }
+    if (ev->vkey == VK_ESCAPE) {
+        if (panel->filterEdit && len(panel->filterWords) > 0) {
+            panel->filterWords.Reset();
+            panel->filterEdit->SetText(Str{});
+        } else if (panel->ownerWin) {
+            HwndSetFocus(panel->ownerWin->hwndFrame);
+        }
+        ev->didHandle = true;
+        return;
+    }
+    panel->listBox->OnKeyDown(ev);
+}
+
+static void OnFolderListChar(FolderFilesPanel* panel, VirtCharEvent* ev) {
+    if (!panel || !panel->filterEdit || ev->c < ' ' || IsCtrlPressed()) {
+        return;
+    }
+    EditSetFocus(panel->filterEdit);
+    SendMessageW(panel->filterEdit->hwnd, WM_CHAR, (WPARAM)ev->c, 0);
+    ev->didHandle = true;
+}
+
+static void OnFolderListTooltip(FolderFilesPanel* panel, VirtTooltipEvent* ev) {
+    if (!panel || !panel->listBox) {
+        return;
+    }
+    int idx = panel->listBox->ItemFromPoint(ev->ptLocal);
+    auto* m = (ListBoxModelFolder*)panel->listBox->model;
+    if (!m || idx < 0 || idx >= m->ItemsCount()) {
+        return;
+    }
+    const NavFileEntry& e = m->entries[idx];
+    if (str::Eq(e.name, StrL(".."))) {
+        ev->tip = str::DupTemp(Tr("Up"));
+        return;
+    }
+    if (e.isDir) {
+        ev->tip = str::DupTemp(FolderEntryPathTemp(panel, e));
+        return;
+    }
+    ev->tip = fmt("%s (%s)", NavEntryBaseName(e), str::FormatSizeShortTemp(e.size));
+}
+
+static void DrawFolderListBoxItem(FolderFilesPanel* panel, VirtListBox::DrawItemEvent* ev) {
+    VirtListBox* lb = ev->listBox;
+    auto* m = (ListBoxModelFolder*)lb->model;
+    if (!panel || !m || ev->itemIndex < 0 || ev->itemIndex >= m->ItemsCount()) {
+        return;
+    }
+
+    Gfx* gfx = ev->gfx;
+    HWND hwndHost = lb->GetHwnd();
+    int dpi = hwndHost ? DpiGetForHwnd(hwndHost) : lb->dpi;
+    Rect rc = ev->itemRect;
+    const NavFileEntry& e = m->entries[ev->itemIndex];
+    TempStr entryPath = FolderEntryPathTemp(panel, e);
+
+    bool isActiveDoc = !e.isDir && len(panel->activeFilePath) > 0 &&
+                       (str::EqI(entryPath, panel->activeFilePath) || path::IsSame(entryPath, panel->activeFilePath));
+
+    Color colBg = lb->GetColor(kColListBg);
+    Color colText = lb->GetColor(kColListText);
+    if (IsSpecialColor(colBg)) {
+        colBg = GetSysColor(COLOR_WINDOW);
+    }
+    if (IsSpecialColor(colText)) {
+        colText = GetSysColor(COLOR_WINDOWTEXT);
+    }
+
+    Color rowBg = colBg;
+    if (isActiveDoc) {
+        rowBg = AccentColor(colBg, 40);
+    } else if (ev->selected) {
+        rowBg = AccentColor(colBg, 22);
+    }
+    gfx->FillRect(rc, rowBg);
+
+    bool isRtl = hwndHost ? HwndIsRtl(hwndHost) : false;
+    bool prevMirrored = isRtl ? gfx->SetMirrored(false) : false;
+
+    if (isActiveDoc) {
+        int barW = std::max(DpiScaleByDpi(dpi, 3), 2);
+        int barPadY = DpiScaleByDpi(dpi, 2);
+        int barX = isRtl ? (rc.Right() - barW) : rc.x;
+        Rect barRc{barX, rc.y + barPadY, barW, std::max(rc.dy - (2 * barPadY), 2)};
+        gfx->FillRect(barRc, AccentColor(colText, 35));
+    }
+
+    int padX = DpiScaleByDpi(dpi, 6);
+    rc.x += padX;
+    rc.dx = std::max(rc.dx - (2 * padX), 0);
+
+    // Left index column ("01", "02", ...) for files
+    int fileOrd = (ev->itemIndex < len(m->fileOrd)) ? m->fileOrd[ev->itemIndex] : 0;
+    TempStr ordStr{};
+    int leftReserve = 0;
+    if (!e.isDir && fileOrd > 0) {
+        ordStr = (fileOrd < 100) ? fmt("%02d", fileOrd) : fmt("%d", fileOrd);
+        int minOrdDx = gfx->MeasureText(StrL("00"), lb->font).dx;
+        int ordDx = std::max(minOrdDx, gfx->MeasureText(ordStr, lb->font).dx);
+        int ordGap = DpiScaleByDpi(dpi, 6);
+        leftReserve = ordDx + ordGap;
+
+        Rect rcOrd = rc;
+        u32 ordFmt = gfxTextVCenter;
+        if (isRtl) {
+            rcOrd.x = rc.Right() - ordDx;
+            rcOrd.dx = ordDx;
+            ordFmt |= gfxTextRight;
+        } else {
+            rcOrd.dx = ordDx;
+            ordFmt |= gfxTextLeft;
+        }
+        gfx->DrawText(ordStr, rcOrd, ordFmt, lb->font, AccentColor(colText, isActiveDoc ? 35 : 95));
+    }
+
+    // Right badge ("P.<page>" if read/active, else short file size)
+    TempStr rightBadge{};
+    int rightReserve = 0;
+    bool hasPageBadge = false;
+    if (!e.isDir) {
+        int pageNo = 0;
+        if (isActiveDoc && panel->ownerWin && panel->ownerWin->currPageNo > 0) {
+            pageNo = panel->ownerWin->currPageNo;
+        } else if (FileHistoryStates()) {
+            FileState* fs = FileHistoryFindByPath(entryPath);
+            if (fs && len(fs->pageNo) > 0) {
+                StoredPagePos pos = ParseStoredPagePos(fs->pageNo);
+                if (pos.pageNo > 0) {
+                    pageNo = pos.pageNo;
+                }
+            }
+        }
+        if (pageNo > 0) {
+            rightBadge = fmt("P.%d", pageNo);
+            hasPageBadge = true;
+        } else {
+            rightBadge = str::FormatSizeShortTemp(e.size);
+        }
+        int badgeDx = gfx->MeasureText(rightBadge, lb->font).dx;
+        int badgeGap = DpiScaleByDpi(dpi, 6);
+        rightReserve = badgeDx + badgeGap;
+
+        Rect rcRight = rc;
+        u32 badgeFmt = gfxTextVCenter;
+        if (isRtl) {
+            rcRight.dx = badgeDx;
+            badgeFmt |= gfxTextLeft | gfxTextRtl;
+        } else {
+            rcRight.x = rc.Right() - badgeDx;
+            rcRight.dx = badgeDx;
+            badgeFmt |= gfxTextRight;
+        }
+        Color badgeCol = AccentColor(colText, (isActiveDoc || hasPageBadge) ? 55 : 95);
+        gfx->DrawText(rightBadge, rcRight, badgeFmt, lb->font, badgeCol);
+    }
+
+    Rect rcText = rc;
+    if (isRtl) {
+        rcText.x += rightReserve;
+        rcText.dx = std::max(rcText.dx - leftReserve - rightReserve, 0);
+    } else {
+        rcText.x += leftReserve;
+        rcText.dx = std::max(rcText.dx - leftReserve - rightReserve, 0);
+    }
+
+    if (rcText.dx > 0) {
+        u32 drawFmt = gfxTextEllipsis | gfxTextVCenter;
+        drawFmt |= isRtl ? (gfxTextRight | gfxTextRtl) : gfxTextLeft;
+        PlatformFont* itemFont = (e.isDir || isActiveDoc) ? GetBoldPlatformFont(lb->font) : lb->font;
+        Str displayTitle = e.isDir && !str::Eq(e.name, StrL("..")) ? e.name : NavEntryBaseName(e);
+        DrawMaybeHighlightedText(gfx, rcText, displayTitle, panel->filterWords, panel->highlighted, rowBg, isRtl, false,
+                                 drawFmt, itemFont, colText);
+    }
+
+    if (isRtl) {
+        gfx->SetMirrored(prevMirrored);
+    }
+}
+
+static void OnFolderNavBtnClick(FolderFilesPanel* panel, VirtMouseEvent* ev) {
+    if (!panel || !ev->target) {
+        return;
+    }
+    auto* btn = (VirtIconButton*)ev->target;
+    switch (btn->id - 1) {
+        case FolderBtnBack:
+            FolderPanelGoBack(panel);
+            break;
+        case FolderBtnForward:
+            FolderPanelGoForward(panel);
+            break;
+        case FolderBtnUp:
+            FolderPanelGoUp(panel);
+            break;
+        case FolderBtnRefresh:
+            FolderPanelRefresh(panel);
+            break;
+    }
+}
+
+static void OnFolderCloseClick(MainWindow* mw, VirtMouseEvent* /*ev*/) {
+    OnFolderFilesToggle(mw, 0);
+}
+
+static LRESULT CALLBACK WndProcFolderFilterEdit(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR /*subclassId*/,
+                                                DWORD_PTR data) {
+    auto* panel = (FolderFilesPanel*)data;
+    if (panel && panel->listBox && msg == WM_KEYDOWN) {
+        if (wp == VK_UP || wp == VK_DOWN || wp == VK_PRIOR || wp == VK_NEXT) {
+            VirtKeyEvent kev;
+            kev.target = panel->listBox;
+            kev.vkey = (int)wp;
+            kev.isCtrl = IsCtrlPressed();
+            kev.isShift = IsShiftPressed();
+            panel->listBox->OnKeyDown(&kev);
+            return 0;
+        }
+        if (wp == VK_RETURN) {
+            int sel = panel->listBox->GetCurrentSelection();
+            if (sel >= 0) {
+                FolderPanelActivateIndex(panel, sel, IsCtrlPressed());
+            }
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            TempStr txt = panel->filterEdit ? panel->filterEdit->GetTextTemp() : TempStr{};
+            if (len(txt) > 0) {
+                panel->filterEdit->SetText(Str{});
+            } else if (panel->ownerWin) {
+                HwndSetFocus(panel->ownerWin->hwndFrame);
+            }
+            return 0;
+        }
+        if (wp == VK_F5) {
+            FolderPanelRefresh(panel);
+            return 0;
+        }
+    }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == '\r' || wp == '\n')) {
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static void LayoutFolderFilesBox(MainWindow* mw) {
+    if (!mw || !mw->hwndFolderFilesBox || !mw->folderFilesPanel || !mw->folderFilesPanel->layout) {
+        return;
+    }
+    Rect rc = HwndClientRect(mw->hwndFolderFilesBox);
+    if (rc.dx <= 0 || rc.dy <= 0) {
+        return;
+    }
+    FolderFilesPanel* panel = mw->folderFilesPanel;
+    LayoutTreeToSize(mw->hwndFolderFilesBox, panel->layout, {rc.dx, rc.dy}, &panel->root);
+}
+
+static LRESULT CALLBACK WndProcFolderFilesBox(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR /*subclassId*/,
+                                              DWORD_PTR data) {
+    MainWindow* mw = (MainWindow*)data;
+    if (!mw || !mw->folderFilesPanel) {
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
+    FolderFilesPanel* panel = mw->folderFilesPanel;
+
+    LRESULT res = TryReflectMessages(hwnd, msg, wp, lp);
+    if (res) {
+        return res;
+    }
+
+    if (VirtHostOnMessage(hwnd, panel->root, msg, wp, lp, res, ThemeControlBackgroundColor())) {
+        return res;
+    }
+
+    switch (msg) {
+        case WM_ERASEBKGND: {
+            HDC hdc = (HDC)wp;
+            HdcFillRect(hdc, HwndClientRect(hwnd), mw->brControlBgColor);
+            return TRUE;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = (HDC)wp;
+            SetTextColor(hdc, ThemeWindowTextColor());
+            SetBkMode(hdc, TRANSPARENT);
+            return (LRESULT)mw->brControlBgColor;
+        }
+        case WM_SIZE:
+            LayoutFolderFilesBox(mw);
+            break;
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static void OnFolderFilesSplitterMove(VirtSplitter::MoveEvent* ev) {
+    MainWindow* mw = FindMainWindowByHwnd(ev->w->GetHwnd());
+    if (!mw || !mw->hwndFolderFilesBox) {
+        return;
+    }
+    Point pcur = HwndGetCursorPos(mw->hwndFrame);
+    Rect rFrame = HwndClientRect(mw->hwndFrame);
+    Rect boxRc = ChildPosWithinParent(mw->hwndFolderFilesBox);
+    bool isRtlLayout = mw->frameLayout && mw->frameLayout->rtl;
+    int dx = isRtlLayout ? (pcur.x - boxRc.x) : (boxRc.Right() - pcur.x);
+
+    int dpi = DpiGetForHwnd(mw->hwndFrame);
+    int minDx = DpiScaleByDpi(dpi, kFolderSidebarMinWidthDip);
+    int maxDx = std::max(minDx, rFrame.dx / 2);
+    if (dx < minDx || dx > maxDx) {
+        ev->resizeAllowed = false;
+        return;
+    }
+    if (ev->queryOnly) {
+        return;
+    }
+    mw->folderFilesDx = dx;
+    if (dpi > 0) {
+        gFolderSidebarWidthDip =
+            limitValue(MulDiv(dx, 96, dpi), kFolderSidebarMinWidthDip, kFolderSidebarMaxWidthDip);
+    }
+    u32 flags = kUiRelayout | kUiNoToolbars;
+    if (!ev->finishedDragging) {
+        flags |= kUiPanelsDrag;
+    } else {
+        SaveFolderSidebarSettings();
+    }
+    ScheduleUiUpdate(mw, flags);
+}
+
+static void UpdateFolderNavButtonIcons(FolderFilesPanel* panel, int dpi) {
+    if (!panel) {
+        return;
+    }
+    static const char* icons[FolderBtnCount] = {gIconNavigateBack, gIconNavigateForward, gIconArrowUp,
+                                                gIconRotateRight};
+    Str tips[FolderBtnCount] = {Tr("Back"), Tr("Forward"), Tr("Up"), Tr("Refresh Folder")};
+    int isz = RoundUp(DpiScaleByDpi(dpi, 15), 4);
+    int pad = DpiScaleByDpi(dpi, 3);
+    Color fg = ThemeWindowTextColor();
+    Color bg = ThemeControlBackgroundColor();
+    Color dis = ThemeWindowTextDisabledColor();
+    for (int i = 0; i < FolderBtnCount; i++) {
+        VirtIconButton* b = panel->navBtns[i];
+        if (!b) {
+            continue;
+        }
+        b->padding = Insets{pad, pad, pad, pad};
+        b->SetTooltip(tips[i]);
+        b->pixmap = GetCachedPixmapForSvg(Str(icons[i]), isz, isz, fg, bg);
+        b->pixmapDisabled = GetCachedPixmapForSvg(Str(icons[i]), isz, isz, dis, bg);
+        b->Invalidate();
+    }
+}
+
+static void UpdateFolderListMetricsAndColors(FolderFilesPanel* panel, int dpi) {
+    if (!panel || !panel->listBox) {
+        return;
+    }
+    Color panelBg = ThemeControlBackgroundColor();
+    Color listBg = ThemeWindowControlBackgroundColor();
+    Color txtCol = ThemeWindowTextColor();
+
+    if (panel->headerLabel) {
+        panel->headerLabel->SetColor(kColTextFg, txtCol);
+    }
+    if (panel->dirLabel) {
+        panel->dirLabel->SetColor(kColTextFg, AccentColor(txtCol, 65));
+    }
+    if (panel->filterEdit) {
+        panel->filterEdit->SetColors(txtCol, listBg);
+    }
+    panel->listBox->dpi = dpi;
+    panel->listBox->SetColor(kColListBg, listBg);
+    panel->listBox->SetColor(kColListText, txtCol);
+    Size textSz = PlatformFontMeasureText(panel->listBox->font, StrL("Ag"));
+    panel->listBox->itemDy = std::max(textSz.dy + DpiScaleByDpi(dpi, 7), DpiScaleByDpi(dpi, 22));
+    (void)panelBg;
+}
+
+static bool ShouldShowFolderFilesForWindow(MainWindow* mw) {
+    if (!mw || !mw->hwndFolderFilesBox || !mw->folderFilesPanel || gPluginMode || !CanAccessDisk()) {
+        return false;
+    }
+    if (mw->isQuickLook) {
+        return false;
+    }
+    EnsureFolderSidebarSettingsLoaded();
+    if (!gFolderSidebarEnabled) {
+        return false;
+    }
+    WindowTab* tab = mw->CurrentTab();
+    if (!tab || tab->IsAboutTab() || tab->IsFavoritesTab()) {
+        return false;
+    }
+    if (len(tab->filePath) == 0) {
+        return false;
+    }
+    TempStr dir = path::GetDirTemp(tab->filePath);
+    if (len(dir) == 0 || !dir::Exists(dir)) {
+        return false;
+    }
+    return true;
+}
+
+void CreateFolderFilesPanel(MainWindow* win) {
+    if (!win || gPluginMode || !CanAccessDisk()) {
+        return;
+    }
+    EnsureFolderSidebarSettingsLoaded();
+    int dpi = DpiGetForHwnd(win->hwndFrame);
+    win->folderFilesDx = DpiScaleByDpi(dpi, gFolderSidebarWidthDip);
+
+    HMODULE hmod = GetModuleHandleW(nullptr);
+    DWORD style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    win->hwndFolderFilesBox =
+        CreateWindowExW(0, WC_STATIC, L"", style, 0, 0, win->folderFilesDx, 0, win->hwndFrame, nullptr, hmod, nullptr);
+    if (!win->hwndFolderFilesBox) {
+        return;
+    }
+    ShowWindow(win->hwndFolderFilesBox, SW_HIDE);
+
+    if (win->folderFilesSplitter) {
+        win->folderFilesSplitter->SetIsVisible(false);
+        win->folderFilesSplitter->onMove = MkFunc1Void(OnFolderFilesSplitterMove);
+    }
+
+    auto* panel = new FolderFilesPanel();
+    panel->ownerWin = win;
+    panel->token = ++gNextFolderPanelToken;
+    win->folderFilesPanel = panel;
+
+    PlatformFont* appFont = GetAppFontForDpi(dpi);
+    PlatformFont* treeFont = GetAppTreeFontForDpi(dpi);
+    PlatformFont* labelFont = GetAppSidebarLabelFontForDpi(dpi);
+
+    auto header = NewLabelWithClose(win->hwndFolderFilesBox, labelFont, MkFunc1(OnFolderCloseClick, win));
+    panel->headerBox = header.box;
+    panel->headerLabel = header.label;
+    panel->closeBtn = header.closeBtn;
+    panel->headerLabel->SetText(Tr("Files in Folder"));
+
+    auto* navRow = new HBox();
+    navRow->alignMain = MainAxisAlign::MainStart;
+    navRow->alignCross = CrossAxisAlign::CrossCenter;
+    navRow->rtl = IsUIRtl();
+    for (int i = 0; i < FolderBtnCount; i++) {
+        auto* b = new VirtIconButton();
+        b->id = i + 1;
+        b->onClick = MkFunc1(OnFolderNavBtnClick, panel);
+        panel->navBtns[i] = b;
+        navRow->AddChild(b);
+    }
+    panel->dirLabel = NewVirtText({
+        .font = appFont,
+        .isRtl = IsUIRtl(),
+        .ellipsis = true,
+    });
+    navRow->AddChild(new Padding(panel->dirLabel, Insets{0, DpiScaleByDpi(dpi, 4), 0, DpiScaleByDpi(dpi, 2)}), 1);
+
+    {
+        Edit::CreateArgs eargs;
+        eargs.parent = win->hwndFolderFilesBox;
+        eargs.withBorder = true;
+        eargs.cueText = Tr("Search");
+        eargs.font = appFont;
+        eargs.isRtl = IsUIRtl();
+        panel->filterEdit = new Edit();
+        panel->filterEdit->Create(eargs);
+        panel->filterEdit->onTextChanged = MkFunc0(OnFolderFilterChanged, panel);
+        panel->filterSubclassId = NextSubclassId();
+        SetWindowSubclass(panel->filterEdit->hwnd, WndProcFolderFilterEdit, panel->filterSubclassId, (DWORD_PTR)panel);
+    }
+
+    {
+        auto* lb = new VirtListBox();
+        lb->dpi = dpi;
+        lb->font = treeFont;
+        lb->showFocusRing = false;
+        lb->padding = DpiScaledInsets(2, 0);
+        lb->onMouseDown = MkFunc1(OnFolderListMouseDown, panel);
+        lb->onMouseUp = MkFunc1(OnFolderListMouseUp, panel);
+        lb->VirtCtrl::onDoubleClick = MkFunc1(OnFolderListDoubleClick, panel);
+        lb->onKeyDown = MkFunc1(OnFolderListKeyDown, panel);
+        lb->onChar = MkFunc1(OnFolderListChar, panel);
+        lb->onGetTooltip = MkFunc1(OnFolderListTooltip, panel);
+        lb->onDrawItem = MkFunc1(DrawFolderListBoxItem, panel);
+        panel->listBox = lb;
+    }
+
+    auto* vbox = new VBox();
+    vbox->alignMain = MainAxisAlign::MainStart;
+    vbox->alignCross = CrossAxisAlign::Stretch;
+    vbox->AddChild(panel->headerBox);
+    vbox->AddChild(new Padding(navRow, Insets{0, 0, DpiScaleByDpi(dpi, 2), 0}));
+    vbox->AddChild(new Padding(panel->filterEdit, Insets{0, 0, DpiScaleByDpi(dpi, 3), 0}));
+    vbox->AddChild(panel->listBox, 1);
+
+    panel->layout = new Padding(vbox, DpiScaledInsets(4, 6));
+
+    panel->boxSubclassId = NextSubclassId();
+    SetWindowSubclass(win->hwndFolderFilesBox, WndProcFolderFilesBox, panel->boxSubclassId, (DWORD_PTR)win);
+
+    UpdateFolderFilesTheme(win);
+    UpdateFolderPanelHeaderAndButtons(panel);
+}
+
+void DestroyFolderFilesPanel(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    FolderFilesPanel* panel = win->folderFilesPanel;
+    win->folderFilesPanel = nullptr;
+
+    if (panel) {
+        panel->scanGen++;
+        if (panel->filterEdit && panel->filterEdit->hwnd && panel->filterSubclassId) {
+            RemoveWindowSubclass(panel->filterEdit->hwnd, WndProcFolderFilterEdit, panel->filterSubclassId);
+            panel->filterSubclassId = 0;
+        }
+        if (win->hwndFolderFilesBox && panel->boxSubclassId) {
+            RemoveWindowSubclass(win->hwndFolderFilesBox, WndProcFolderFilesBox, panel->boxSubclassId);
+            panel->boxSubclassId = 0;
+        }
+        delete panel->layout;
+        panel->layout = nullptr;
+        delete panel->root;
+        panel->root = nullptr;
+        delete panel;
+    }
+
+    if (win->folderFilesSplitter) {
+        win->folderFilesSplitter->SetIsVisible(false);
+        win->folderFilesSplitter->onMove = {};
+    }
+
+    if (win->hwndFolderFilesBox) {
+        DestroyWindow(win->hwndFolderFilesBox);
+        win->hwndFolderFilesBox = nullptr;
+    }
+}
+
+void SyncFolderFilesToCurrentTab(MainWindow* win, bool forceRefresh) {
+    if (!win || !win->folderFilesPanel) {
+        return;
+    }
+    FolderFilesPanel* panel = win->folderFilesPanel;
+    bool prevVis = win->uiState.folderFilesVisible;
+    bool wantVis = ShouldShowFolderFilesForWindow(win);
+    win->uiState.folderFilesVisible = wantVis;
+
+    if (!wantVis) {
+        str::ReplaceWithCopy(&panel->activeFilePath, Str{});
+        if (prevVis != wantVis) {
+            ScheduleUiUpdate(win);
+        }
+        return;
+    }
+
+    WindowTab* tab = win->CurrentTab();
+    Str filePath = tab ? tab->filePath : Str{};
+    TempStr dir = path::GetDirTemp(filePath);
+    str::ReplaceWithCopy(&panel->activeFilePath, filePath);
+
+    bool sameDir = len(panel->currDir) > 0 && path::IsSame(panel->currDir, dir);
+    if (sameDir && !forceRefresh) {
+        auto* m = (ListBoxModelFolder*)panel->listBox->model;
+        if (m) {
+            int idx = FindFolderEntryIndex(panel, m, filePath);
+            if (idx >= 0) {
+                panel->listBox->SetCurrentSelection(idx);
+            }
+        }
+        panel->listBox->Invalidate();
+    } else if (sameDir && forceRefresh) {
+        FolderPanelSetDir(panel, dir, filePath, NavListReset::Keep);
+    } else {
+        FolderPanelNavigate(panel, dir, filePath, NavListReset::Clear);
+    }
+
+    if (prevVis != wantVis) {
+        ScheduleUiUpdate(win);
+    }
+}
+
+void OnFolderFilesToggle(MainWindow* win, int forceState) {
+    EnsureFolderSidebarSettingsLoaded();
+    bool newState = !gFolderSidebarEnabled;
+    if (forceState == 0) {
+        newState = false;
+    } else if (forceState == 1) {
+        newState = true;
+    }
+    gFolderSidebarEnabled = newState;
+    SaveFolderSidebarSettings();
+
+    for (MainWindow* mw : gWindows) {
+        SyncFolderFilesToCurrentTab(mw, false);
+        if (mw->menu) {
+            UpdateAppMenu(mw, mw->menu);
+        }
+        ScheduleUiUpdate(mw);
+    }
+    if (win && !newState) {
+        HwndSetFocus(win->hwndFrame);
+    }
+}
+
+void UpdateFolderFilesTheme(MainWindow* win) {
+    if (!win || !win->hwndFolderFilesBox || !win->folderFilesPanel) {
+        return;
+    }
+    FolderFilesPanel* panel = win->folderFilesPanel;
+    int dpi = DpiGetForHwnd(win->hwndFolderFilesBox);
+    UpdateFolderListMetricsAndColors(panel, dpi);
+    UpdateFolderNavButtonIcons(panel, dpi);
+    DarkModeApplyToChildControls(win->hwndFolderFilesBox);
+    RedrawWindow(win->hwndFolderFilesBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+void UpdateFolderFilesDpi(MainWindow* win, int dpi) {
+    if (!win || !win->hwndFolderFilesBox || !win->folderFilesPanel || dpi <= 0) {
+        return;
+    }
+    FolderFilesPanel* panel = win->folderFilesPanel;
+    win->folderFilesDx = DpiScaleByDpi(dpi, gFolderSidebarWidthDip);
+
+    PlatformFont* appFont = GetAppFontForDpi(dpi);
+    PlatformFont* treeFont = GetAppTreeFontForDpi(dpi);
+    PlatformFont* labelFont = GetAppSidebarLabelFontForDpi(dpi);
+
+    if (panel->headerLabel && panel->closeBtn) {
+        ApplyLabelWithCloseDpi(panel->headerLabel, panel->closeBtn, dpi);
+        panel->headerLabel->font = labelFont;
+    }
+    if (panel->dirLabel) {
+        panel->dirLabel->font = appFont;
+    }
+    if (panel->filterEdit) {
+        panel->filterEdit->SetFont(appFont);
+    }
+    if (panel->listBox) {
+        panel->listBox->font = treeFont;
+    }
+    UpdateFolderListMetricsAndColors(panel, dpi);
+    UpdateFolderNavButtonIcons(panel, dpi);
+    RelayoutFolderFilesPanel(win);
+    HwndInvalidate(win->hwndFolderFilesBox, true);
+}
+
+void RelayoutFolderFilesPanel(MainWindow* win) {
+    if (!win || !win->hwndFolderFilesBox || !win->uiState.folderFilesVisible) {
+        return;
+    }
+    LayoutFolderFilesBox(win);
+    RedrawWindow(win->hwndFolderFilesBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (win->folderFilesSplitter) {
+        win->folderFilesSplitter->Invalidate();
+    }
+}
+
+void InvalidateFolderFilesPanel(MainWindow* win) {
+    if (!win || !win->hwndFolderFilesBox || !win->uiState.folderFilesVisible || !win->folderFilesPanel) {
+        return;
+    }
+    if (win->folderFilesPanel->listBox) {
+        win->folderFilesPanel->listBox->Invalidate();
+    }
 }

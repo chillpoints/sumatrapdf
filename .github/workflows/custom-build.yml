@@ -1,0 +1,39 @@
+name: Build Custom SumatraPDF
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-x64-static:
+    name: Build x64 Standalone SumatraPDF
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build SumatraPDF-static (x64 Release)
+        run: bun cmd/build-custom.ts
+
+      - name: Upload SumatraPDF.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SumatraPDF-x64-folder-sidebar
+          path: out/rel64/SumatraPDF.exe
+          if-no-files-found: error
+
+      - name: Publish Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: custom-folder-sidebar
+          name: SumatraPDF Custom (Folder Playlist Sidebar)
+          prerelease: false
+          files: out/rel64/SumatraPDF.exe
